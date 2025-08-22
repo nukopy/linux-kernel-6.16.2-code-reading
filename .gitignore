@@ -234,6 +234,7 @@ virt
 !.gitignore
 !README.md
 !CLAUDE.md
+!.github/
 !.vscode/
 !.claude/
 !docs
