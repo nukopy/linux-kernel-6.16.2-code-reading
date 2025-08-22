@@ -48,6 +48,92 @@ TCP/IP は以下の主要プロトコルで構成されます：
 - `net/ipv4/ip_input.c` - IPv4 パケット受信処理
 - `net/ipv4/ip_output.c` - IPv4 パケット送信処理
 
+#### IP パケット受信処理の実装解析
+
+`ip_rcv()` 関数は IPv4 パケット受信処理の中核です：
+
+```c
+// net/ipv4/ip_input.c
+int ip_rcv(struct sk_buff *skb, struct net_device *dev, 
+           struct packet_type *pt, struct net_device *orig_dev)
+{
+    const struct iphdr *iph;
+    u32 len;
+
+    /* パケットがIPパケットかチェック */
+    if (skb->pkt_type == PACKET_OTHERHOST)
+        goto drop;
+
+    IP_UPD_PO_STATS_BH(dev_net(dev), IPSTATS_MIB_IN, skb->len);
+
+    skb = skb_share_check(skb, GFP_ATOMIC);
+    if (!skb) {
+        IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INDISCARDS);
+        goto out;
+    }
+
+    if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+        goto inhdr_error;
+
+    iph = ip_hdr(skb);
+
+    /* IPヘッダーの基本チェック */
+    if (iph->ihl < 5 || iph->version != 4)
+        goto inhdr_error;
+
+    BUILD_BUG_ON(IPSTATS_MIB_ECT1PKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_ECT_1);
+    BUILD_BUG_ON(IPSTATS_MIB_ECT0PKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_ECT_0);
+    BUILD_BUG_ON(IPSTATS_MIB_CEPKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_CE);
+    IP_ADD_STATS_BH(dev_net(dev),
+                    IPSTATS_MIB_NOECTPKTS + (iph->tos & INET_ECN_MASK),
+                    max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
+
+    /* チェックサム検証とパケット長の確認 */
+    if (!pskb_may_pull(skb, iph->ihl*4))
+        goto inhdr_error;
+
+    iph = ip_hdr(skb);
+
+    if (unlikely(ip_fast_csum((u8*)iph, iph->ihl)))
+        goto csum_error;
+
+    len = ntohs(iph->tot_len);
+    if (skb->len < len) {
+        IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INTRUNCATEDPKTS);
+        goto drop;
+    } else if (len < (iph->ihl*4))
+        goto inhdr_error;
+
+    /* パケットのトリミング */
+    if (pskb_trim_rcsum(skb, len)) {
+        IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INDISCARDS);
+        goto drop;
+    }
+
+    skb->transport_header = skb->network_header + iph->ihl*4;
+
+    /* NetFilter フックポイント */
+    return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, skb, dev, NULL,
+                   ip_rcv_finish);
+
+csum_error:
+    IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_CSUMERRORS);
+inhdr_error:
+    IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INHDRERRORS);
+drop:
+    kfree_skb(skb);
+out:
+    return NET_RX_DROP;
+}
+```
+
+**解析ポイント:**
+1. **パケット種別の確認**: `skb->pkt_type` で自分宛のパケットかチェック
+2. **IPヘッダー検証**: バージョン（4）とヘッダー長の最小サイズをチェック
+3. **チェックサム検証**: `ip_fast_csum()` でヘッダーの整合性を確認
+4. **パケット長チェック**: `tot_len` フィールドと実際のデータ長を比較
+5. **NetFilter統合**: `NF_HOOK` でファイアウォール処理に連携
+
 ### TCP (Transmission Control Protocol)
 - 信頼性のあるコネクション指向通信
 - フロー制御、輻輳制御、エラー回復
@@ -58,11 +144,411 @@ TCP/IP は以下の主要プロトコルで構成されます：
 - `net/ipv4/tcp_output.c` - TCP パケット出力処理
 - `net/ipv4/tcp_timer.c` - TCP タイマー管理
 
+#### TCP ソケット構造体の解析
+
+TCP の核となる `tcp_sock` 構造体：
+
+```c
+// include/linux/tcp.h
+struct tcp_sock {
+    /* inet_connection_sock 構造体を継承 */
+    struct inet_connection_sock inet_conn;
+
+    /* TCP 固有の制御ブロック */
+    u16 tcp_header_len;     /* TCP ヘッダー長 (オプション含む) */
+    u16 gso_segs;          /* GSO セグメント数 */
+    
+    /* 送信制御 */
+    u32 snd_nxt;           /* 次に送信するシーケンス番号 */
+    u32 snd_una;           /* 未確認の最小シーケンス番号 */
+    u32 snd_sml;           /* 最後に送信した小さなパケットのシーケンス番号 */
+    u32 rcv_tstamp;        /* 最後にデータを受信した時刻 */
+    u32 lsndtime;          /* 最後にデータを送信した時刻 */
+
+    /* 受信制御 */
+    u32 rcv_nxt;           /* 次に受信すべきシーケンス番号 */
+    u32 copied_seq;        /* ユーザー空間にコピー済みのシーケンス番号 */
+    u32 rcv_wup;           /* ウィンドウ更新送信時のrcv_nxt */
+    u32 snd_wnd;           /* 送信ウィンドウサイズ */
+    u32 max_window;        /* 最大ウィンドウサイズ */
+    u32 mss_cache;         /* キャッシュされたMSS */
+
+    /* フロー制御 */
+    u32 window_clamp;      /* ウィンドウサイズの上限 */
+    u32 rcv_ssthresh;      /* 受信スローリスト閾値 */
+
+    /* 輻輳制御 */
+    u32 snd_cwnd;          /* 輻輳ウィンドウサイズ */
+    u32 snd_ssthresh;      /* スローリスト閾値 */
+    u32 prior_cwnd;        /* 前回の輻輳ウィンドウ */
+    u32 prr_delivered;     /* PRR: 配信済みセグメント数 */
+    u32 prr_out;           /* PRR: 送信済みセグメント数 */
+
+    /* RTT 測定 */
+    u32 srtt_us;           /* 平滑化RTT (μ秒) */
+    u32 mdev_us;           /* RTT偏差 (μ秒) */
+    u32 mdev_max_us;       /* 最大RTT偏差 */
+    u32 rttvar_us;         /* RTT分散 */
+    u32 rtt_seq;           /* RTT測定対象のシーケンス番号 */
+
+    /* 再送制御 */
+    struct sk_buff_head out_of_order_queue; /* 順序外パケット待ち */
+    struct tcp_sack_block duplicate_sack[1]; /* D-SACK情報 */
+    struct tcp_sack_block selective_acks[4]; /* SACK情報 */
+    
+    /* 高速再送/高速復旧 */
+    u8 reordering;         /* パケット並び替え耐性 */
+    u8 keepalive_probes;   /* キープアライブ試行回数 */
+    
+    /* タイマー */
+    struct timer_list retransmit_timer; /* 再送タイマー */
+    struct timer_list delack_timer;     /* 遅延ACKタイマー */
+    
+    /* その他のTCP拡張機能 */
+    u8 ecn_flags;          /* ECN フラグ */
+    u8 syn_retries;        /* SYN 再送回数 */
+};
+```
+
+**解析ポイント:**
+1. **シーケンス番号管理**: `snd_nxt`, `rcv_nxt` でデータの順序制御
+2. **ウィンドウ制御**: `snd_wnd`, `rcv_wnd` でフロー制御実現
+3. **輻輳制御**: `snd_cwnd`, `snd_ssthresh` で帯域制御
+4. **RTT測定**: `srtt_us`, `mdev_us` で応答時間監視と再送間隔決定
+5. **SACK**: `selective_acks` で選択的確認応答による効率的な再送
+
+#### TCP 送信処理の実装解析
+
+`tcp_sendmsg()` 関数はアプリケーションからのデータ送信要求を処理：
+
+```c
+// net/ipv4/tcp.c
+int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *skb;
+    struct sockcm_cookie sockc;
+    int flags, err, copied = 0;
+    int mss_now = 0, size_goal;
+    bool process_backlog = false;
+    bool sg;
+    long timeo;
+
+    lock_sock(sk);
+
+    flags = msg->msg_flags;
+    if (flags & MSG_FASTOPEN) {
+        err = tcp_sendmsg_fastopen(sk, msg, &copied, size);
+        if (err == -EINPROGRESS && copied > 0)
+            goto out;
+        if (err)
+            goto out_err;
+    }
+
+    timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
+
+    tcp_rate_check_app_limited(sk);  /* 帯域制限チェック */
+
+    /* ソケット状態の確認 */
+    if (((1 << sk->sk_state) & ~(TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)) &&
+        !tcp_passive_fastopen(sk)) {
+        err = sk_stream_wait_connect(sk, &timeo);
+        if (err != 0)
+            goto do_error;
+    }
+
+    if (unlikely(tp->repair)) {
+        if (tp->repair_queue == TCP_RECV_QUEUE) {
+            copied = tcp_send_rcvq(sk, msg, size);
+            goto out_nopush;
+        }
+
+        err = -EINVAL;
+        if (tp->repair_queue == TCP_NO_QUEUE)
+            goto out_err;
+    }
+
+    mss_now = tcp_send_mss(sk, &size_goal, flags);
+
+    /* メインの送信ループ */
+    while (msg_data_left(msg)) {
+        int copy = 0;
+        int max = size_goal;
+
+        skb = tcp_write_queue_tail(sk);
+        if (tcp_send_head(sk)) {
+            if (skb->ip_summed == CHECKSUM_NONE)
+                max = mss_now;
+            copy = max - skb->len;
+        }
+
+        if (copy <= 0 || !tcp_skb_can_collapse_to(skb)) {
+new_segment:
+            /* 新しいセグメント作成 */
+            if (!sk_stream_memory_free(sk))
+                goto wait_for_sndbuf;
+
+            skb = sk_stream_alloc_skb(sk, 
+                                    select_size(sk, sg),
+                                    sk->sk_allocation,
+                                    skb_queue_empty(&sk->sk_write_queue));
+            if (!skb)
+                goto wait_for_memory;
+
+            process_backlog = true;
+            skb_entail(sk, skb);
+            copy = size_goal;
+            max = size_goal;
+        }
+
+        /* データのコピー */
+        copy = min_t(int, copy, msg_data_left(msg));
+
+        /* ユーザー空間からカーネル空間へデータコピー */
+        err = skb_add_data_nocache(sk, skb, &msg->msg_iter, copy);
+        if (err)
+            goto do_fault;
+
+        if (!copied)
+            TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_PSH;
+
+        tp->write_seq += copy;
+        TCP_SKB_CB(skb)->end_seq += copy;
+        tcp_skb_pcount_set(skb, 0);
+
+        copied += copy;
+        if (!msg_data_left(msg)) {
+            if (unlikely(flags & MSG_EOR))
+                TCP_SKB_CB(skb)->eor = 1;
+            goto out;
+        }
+
+        if (skb->len < max || (flags & MSG_OOB) || unlikely(tp->repair))
+            continue;
+
+        if (forced_push(tp)) {
+            tcp_mark_push(tp, skb);
+            __tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
+        } else if (skb == tcp_send_head(sk))
+            tcp_push_one(sk, mss_now);
+        continue;
+
+wait_for_sndbuf:
+        set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+wait_for_memory:
+        if (copied)
+            tcp_push(sk, flags & ~MSG_MORE, mss_now,
+                     TCP_NAGLE_PUSH, size_goal);
+
+        err = sk_stream_wait_memory(sk, &timeo);
+        if (err != 0)
+            goto do_error;
+
+        mss_now = tcp_send_mss(sk, &size_goal, flags);
+    }
+
+out:
+    if (copied && !(flags & MSG_SENDPAGE_NOTLAST))
+        tcp_push(sk, flags, mss_now, tp->nonagle, size_goal);
+
+out_nopush:
+    release_sock(sk);
+    return copied + copied_syn;
+
+do_fault:
+    if (!skb->len) {
+        tcp_unlink_write_queue(skb, sk);
+        sk_wmem_free_skb(sk, skb);
+    }
+
+do_error:
+    if (copied + copied_syn)
+        goto out;
+out_err:
+    err = sk_stream_error(sk, flags, err);
+    release_sock(sk);
+    return err;
+}
+```
+
+**解析ポイント:**
+1. **接続状態確認**: `sk_state` でTCP接続の状態をチェック
+2. **MSS計算**: `tcp_send_mss()` で最適なセグメントサイズを決定
+3. **セグメント作成**: `sk_stream_alloc_skb()` で新しいskb構造体を割り当て
+4. **データコピー**: `skb_add_data_nocache()` でユーザーデータをコピー
+5. **送信処理**: `tcp_push()` で実際のパケット送信を実行
+6. **フロー制御**: `sk_stream_wait_memory()` で送信バッファが満杯時に待機
+
 ### UDP (User Datagram Protocol)
 - シンプルなコネクションレス通信
 
 **関連ソースコード:**
 - `net/ipv4/udp.c` - UDP 実装
+
+#### UDP 送信処理の実装解析
+
+TCP と比較して非常にシンプルな UDP 送信処理：
+
+```c
+// net/ipv4/udp.c  
+int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+{
+    struct inet_sock *inet = inet_sk(sk);
+    struct udp_sock *up = udp_sk(sk);
+    DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
+    struct flowi4 fl4_stack;
+    struct flowi4 *fl4;
+    int ulen = len;
+    struct ipcm_cookie ipc;
+    struct rtable *rt = NULL;
+    int free = 0;
+    int connected = 0;
+    __be32 daddr, faddr, saddr;
+    __be16 dport;
+    u8  tos;
+    int err, is_udplite = IS_UDPLITE(sk);
+    int corkreq = up->corkflag || msg->msg_flags&MSG_MORE;
+    int (*getfrag)(void *, char *, int, int, int, struct sk_buff *);
+    struct sk_buff *skb;
+    struct ip_options_data opt_copy;
+
+    if (len > 0xFFFF)
+        return -EMSGSIZE;
+
+    /* 宛先アドレス決定 */
+    if (msg->msg_name) {
+        struct sockaddr_in *usin = (struct sockaddr_in *)msg->msg_name;
+        if (msg->msg_namelen < sizeof(*usin))
+            return -EINVAL;
+        if (usin->sin_family != AF_INET) {
+            if (usin->sin_family != AF_UNSPEC)
+                return -EAFNOSUPPORT;
+        }
+
+        daddr = usin->sin_addr.s_addr;
+        dport = usin->sin_port;
+        if (dport == 0)
+            return -EINVAL;
+    } else {
+        if (sk->sk_state != TCP_ESTABLISHED)
+            return -EDESTADDRREQ;
+        daddr = inet->inet_daddr;
+        dport = inet->inet_dport;
+        connected = 1;
+    }
+
+    /* 送信元アドレス決定 */  
+    ipc.addr = inet->inet_saddr;
+    ipc.oif = sk->sk_bound_dev_if;
+
+    if (msg->msg_controllen) {
+        err = ip_cmsg_send(sock_net(sk), msg, &ipc,
+                          sk->sk_family == AF_INET6);
+        if (unlikely(err)) {
+            kfree(opt_copy.opt.optlen ? &opt_copy : NULL);
+            return err;
+        }
+        if (ipc.opt)
+            free = 1;
+        connected = 0;
+    }
+
+    saddr = ipc.addr;
+    ipc.addr = faddr = daddr;
+
+    /* ルーティング */
+    if (connected && !corkreq) {
+        rt = (struct rtable *)sk_dst_check(sk, 0);
+        if (rt) {
+            if (rt->rt_route_iif != LOOPBACK_IFINDEX &&
+                rt->rt_route_iif != dev_net(rt->dst.dev)->loopback_dev->ifindex) {
+                dst_release(&rt->dst);
+                rt = NULL;
+            }
+        }
+    }
+
+    if (!rt) {
+        struct net *net = sock_net(sk);
+
+        fl4 = &fl4_stack;
+        flowi4_init_output(fl4, ipc.oif, sk->sk_mark, tos,
+                          RT_SCOPE_UNIVERSE, sk->sk_protocol,
+                          inet_sk_flowi_flags(sk),
+                          faddr, saddr, dport, inet->inet_sport);
+
+        security_sk_classify_flow(sk, flowi4_to_flowi(fl4));
+        rt = ip_route_output_flow(net, fl4, sk);
+        if (IS_ERR(rt)) {
+            err = PTR_ERR(rt);
+            rt = NULL;
+            if (err == -ENETUNREACH)
+                IP_INC_STATS(net, IPSTATS_MIB_OUTNOROUTES);
+            goto out;
+        }
+
+        err = -EACCES;
+        if ((rt->rt_flags & RTCF_BROADCAST) &&
+            !sock_flag(sk, SOCK_BROADCAST))
+            goto out;
+        if (connected)
+            sk_dst_set(sk, dst_clone(&rt->dst));
+    }
+
+    if (msg->msg_flags&MSG_CONFIRM)
+        goto do_confirm;
+back_from_confirm:
+
+    saddr = fl4->saddr;
+    if (!ipc.addr)
+        daddr = ipc.addr = fl4->daddr;
+
+    /* フラグメント処理 */
+    lock_sock(sk);
+    if (up->pending) {
+        /*
+         * There are pending frames.
+         * The socket lock must be held while it's corked.
+         */
+        fl4 = &inet->cork.fl.u.ip4;
+        goto do_append_data;
+    }
+    up->len += ulen;
+    err = ip_append_data(sk, fl4, getfrag, msg,
+                        ulen, sizeof(struct udphdr), &ipc, &rt,
+                        corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
+    if (err)
+        udp_flush_pending_frames(sk);
+    else if (!corkreq)
+        err = udp_push_pending_frames(sk);
+    else if (unlikely(skb_queue_empty(&sk->sk_write_queue)))
+        up->pending = 0;
+    release_sock(sk);
+
+out:
+    ip_rt_put(rt);
+    if (free)
+        kfree(opt_copy.opt.optlen ? &opt_copy : NULL);
+    if (!err)
+        return len;
+    return err;
+
+do_confirm:
+    dst_confirm(&rt->dst);
+    if (!(msg->msg_flags&MSG_PROBE) || len)
+        goto back_from_confirm;
+    err = 0;
+    goto out;
+}
+```
+
+**解析ポイント:**
+1. **宛先決定**: `msg->msg_name` から宛先アドレスとポートを取得
+2. **ルーティング**: `ip_route_output_flow()` で送信経路を決定
+3. **ブロードキャスト制御**: `RTCF_BROADCAST` フラグでブロードキャスト送信の権限チェック
+4. **フラグメント処理**: `ip_append_data()` で大きなデータグラムの分割
+5. **送信実行**: `udp_push_pending_frames()` で実際のパケット送信
+6. **接続型UDP**: 一度connect()されたソケットは宛先情報を再利用
 
 ## TCP/IP プロトコルスタックによる、HTTP over TCP の処理の流れ
 

@@ -54,6 +54,296 @@ kernel/bpf/verifier.c
   └── check_mem_access()        // メモリアクセス検証
 ```
 
+#### eBPF システムコールの実装解析
+
+`bpf()` システムコールは eBPF の全ての操作を担当する統一エントリーポイントです：
+
+```c
+// kernel/bpf/syscall.c
+SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
+{
+    union bpf_attr attr = {};
+    int err;
+
+    if (sysctl_unprivileged_bpf_disabled && !bpf_capable())
+        return -EPERM;
+
+    err = bpf_check_uarg_tail_zero(uattr, sizeof(attr), size);
+    if (err)
+        return err;
+    size = min_t(u32, size, sizeof(attr));
+
+    /* ユーザー空間から属性をコピー */
+    if (copy_from_user(&attr, uattr, size) != 0)
+        return -EFAULT;
+
+    err = security_bpf(cmd, &attr, size);
+    if (err < 0)
+        return err;
+
+    switch (cmd) {
+    case BPF_MAP_CREATE:
+        err = map_create(&attr);
+        break;
+    case BPF_MAP_LOOKUP_ELEM:
+        err = map_lookup_elem(&attr);
+        break;
+    case BPF_MAP_UPDATE_ELEM:
+        err = map_update_elem(&attr);
+        break;
+    case BPF_MAP_DELETE_ELEM:
+        err = map_delete_elem(&attr);
+        break;
+    case BPF_MAP_GET_NEXT_KEY:
+        err = map_get_next_key(&attr);
+        break;
+    case BPF_PROG_LOAD:
+        err = bpf_prog_load(&attr, uattr);
+        break;
+    case BPF_OBJ_PIN:
+        err = bpf_obj_pin(&attr);
+        break;
+    case BPF_OBJ_GET:
+        err = bpf_obj_get(&attr);
+        break;
+    case BPF_PROG_ATTACH:
+        err = bpf_prog_attach(&attr);
+        break;
+    case BPF_PROG_DETACH:
+        err = bpf_prog_detach(&attr);
+        break;
+    case BPF_PROG_QUERY:
+        err = bpf_prog_query(&attr, uattr);
+        break;
+    case BPF_PROG_TEST_RUN:
+        err = bpf_prog_test_run(&attr, uattr);
+        break;
+    case BPF_PROG_GET_NEXT_ID:
+        err = bpf_prog_get_next_id(&attr);
+        break;
+    case BPF_MAP_GET_NEXT_ID:
+        err = bpf_map_get_next_id(&attr);
+        break;
+    case BPF_PROG_GET_FD_BY_ID:
+        err = bpf_prog_get_fd_by_id(&attr);
+        break;
+    case BPF_MAP_GET_FD_BY_ID:
+        err = bpf_map_get_fd_by_id(&attr);
+        break;
+    case BPF_OBJ_GET_INFO_BY_FD:
+        err = bpf_obj_get_info_by_fd(&attr, uattr);
+        break;
+    case BPF_RAW_TRACEPOINT_OPEN:
+        err = bpf_raw_tracepoint_open(&attr);
+        break;
+    case BPF_BTF_LOAD:
+        err = bpf_btf_load(&attr);
+        break;
+    case BPF_BTF_GET_FD_BY_ID:
+        err = bpf_btf_get_fd_by_id(&attr);
+        break;
+    case BPF_TASK_FD_QUERY:
+        err = bpf_task_fd_query(&attr, uattr);
+        break;
+    case BPF_MAP_LOOKUP_AND_DELETE_ELEM:
+        err = map_lookup_and_delete_elem(&attr);
+        break;
+    default:
+        err = -EINVAL;
+        break;
+    }
+
+    return err;
+}
+```
+
+**解析ポイント:**
+1. **権限チェック**: `bpf_capable()` で非特権ユーザーからの実行を制御
+2. **セキュリティフック**: `security_bpf()` でLSMによる追加セキュリティチェック
+3. **コマンド分岐**: switch文で20以上のサブコマンドに対応
+4. **ユーザー空間連携**: `copy_from_user()` で安全なデータ転送
+5. **統一インターフェース**: 全てのeBPF操作を1つのシステムコールで処理
+
+#### eBPF プログラム検証器の実装解析
+
+`bpf_check()` 関数は eBPF プログラムの安全性を保証する検証器の核：
+
+```c
+// kernel/bpf/verifier.c
+int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+              union bpf_attr __user *uattr)
+{
+    struct bpf_verifier_env *env;
+    struct bpf_verifier_log *log;
+    int i, len, ret = -EINVAL;
+    bool is_priv;
+
+    /* 検証環境の初期化 */
+    env = kzalloc(sizeof(struct bpf_verifier_env), GFP_KERNEL);
+    if (!env)
+        return -ENOMEM;
+
+    log = &env->log;
+
+    env->insn_aux_data =
+        vzalloc(array_size(sizeof(struct bpf_insn_aux_data),
+                          (*prog)->len));
+    ret = -ENOMEM;
+    if (!env->insn_aux_data)
+        goto err_free_env;
+
+    for (i = 0; i < (*prog)->len; i++)
+        env->insn_aux_data[i].orig_idx = i;
+    env->prog = *prog;
+    env->ops = bpf_verifier_ops[env->prog->type];
+    is_priv = bpf_capable();
+
+    /* ログレベル設定 */
+    if (attr->log_level || attr->log_buf || attr->log_size) {
+        /* ユーザーがログを要求した場合 */
+        ret = -EINVAL;
+        if (attr->log_buf && !attr->log_size)
+            goto err_free_aux_data;
+        if (attr->log_size < 128 || attr->log_size > UINT_MAX >> 2 ||
+            attr->log_size & (sizeof(long) - 1))
+            goto err_free_aux_data;
+
+        log->level = attr->log_level;
+        log->ubuf = (char __user *) (unsigned long) attr->log_buf;
+        log->len_total = attr->log_size;
+
+        ret = -ENOMEM;
+        log->kbuf = kvmalloc(log->len_total, GFP_KERNEL);
+        if (!log->kbuf)
+            goto err_free_aux_data;
+    }
+
+    env->strict_alignment = !!(attr->prog_flags & BPF_F_STRICT_ALIGNMENT);
+    if (!IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS))
+        env->strict_alignment = true;
+    if (attr->prog_flags & BPF_F_ANY_ALIGNMENT)
+        env->strict_alignment = false;
+
+    env->allow_ptr_leaks = bpf_allow_ptr_leaks();
+
+    ret = replace_map_fd_with_map_ptr(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    if (bpf_prog_is_dev_bound(env->prog->aux)) {
+        ret = bpf_prog_offload_verifier_prep(env->prog);
+        if (ret)
+            goto skip_full_check;
+    }
+
+    /* 制御フローグラフ（CFG）の構築と検証 */
+    ret = check_cfg(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    /* メイン検証ループ */
+    env->explored_states = kvcalloc(state_htab_size(env),
+                                   sizeof(struct bpf_verifier_state_list *),
+                                   GFP_USER);
+    ret = -ENOMEM;
+    if (!env->explored_states)
+        goto skip_full_check;
+
+    ret = check_subprogs(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    ret = check_btf_info(env, attr, uattr);
+    if (ret < 0)
+        goto skip_full_check;
+
+    ret = check_attach_btf_id(env);
+    if (ret)
+        goto skip_full_check;
+
+    ret = resolve_pseudo_ldimm64(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    /* 深度優先探索による命令検証 */
+    ret = do_check(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    ret = check_max_stack_depth(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    /* JITコンパイル用の最適化 */
+    ret = optimize_bpf_loop(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    /* プログラム変換とパッチ適用 */
+    ret = fixup_bpf_calls(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    ret = fixup_kfunc_calls(env);
+    if (ret < 0)
+        goto skip_full_check;
+
+    if (log->level && bpf_verifier_log_full(log))
+        ret = -ENOSPC;
+
+    if (log->level && !log->ubuf) {
+        ret = -EFAULT;
+        goto err_release_maps;
+    }
+
+skip_full_check:
+    if (ret)
+        goto err_release_maps;
+
+    if (log->level && log->ubuf) {
+        if (copy_to_user(log->ubuf, log->kbuf, log->len_used) != 0) {
+            ret = -EFAULT;
+            goto err_release_maps;
+        }
+    }
+
+    /* プログラム統計情報の更新 */
+    if (env->prog->aux->offload) {
+        ret = bpf_prog_offload_finalize(env);
+        if (ret)
+            goto err_release_maps;
+    }
+
+    bpf_prog_select_runtime(env->prog, &ret);
+
+    kvfree(env->explored_states);
+
+    if (log->kbuf) {
+        kvfree(log->kbuf);
+        log->kbuf = NULL;
+    }
+
+err_release_maps:
+    if (!env->prog->aux->used_maps)
+        /* if we didn't copy map pointers into bpf_prog_info, release them */
+        release_maps(env);
+
+err_free_aux_data:
+    kvfree(env->insn_aux_data);
+err_free_env:
+    kfree(env);
+    return ret;
+}
+```
+
+**解析ポイント:**
+1. **環境初期化**: `bpf_verifier_env` で検証状態を管理
+2. **CFG検証**: `check_cfg()` で制御フローの正当性をチェック
+3. **深度優先検証**: `do_check()` で全ての実行パスを探索
+4. **スタック検証**: `check_max_stack_depth()` でスタックオーバーフロー防止
+5. **最適化**: `optimize_bpf_loop()` でループ最適化を適用
+6. **パッチ適用**: `fixup_bpf_calls()` でヘルパー関数呼び出しを解決
+
 ## eBPF によるパケットフィルタリングの基礎
 
 ### 基本的なパケットフィルタリングの仕組み
@@ -84,6 +374,241 @@ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
 include/linux/filter.h
   └── struct xdp_md             // XDP メタデータ構造体
 ```
+
+#### XDP プログラム実行の実装解析
+
+ネットワークドライバ内での XDP プログラム実行の典型例：
+
+```c
+// drivers/net/ethernet/mellanox/mlx5/core/en_rx.c  
+static inline int mlx5e_xdp_handle(struct mlx5e_rq *rq,
+                                  struct mlx5e_dma_info *di,
+                                  void *va, u16 *rx_headroom, u32 *len)
+{
+    struct bpf_prog *prog = rcu_dereference(rq->xdp_prog);
+    struct xdp_buff xdp;
+    u32 act;
+    int err;
+
+    if (!prog)
+        return MLX5E_XDP_PASS;
+
+    /* XDP バッファの初期化 */
+    xdp.data = va + *rx_headroom;
+    xdp_set_data_meta_invalid(&xdp);
+    xdp.data_end = xdp.data + *len;
+    xdp.data_hard_start = va;
+    xdp.rxq = &rq->xdp_rxq;
+
+    /* XDP プログラムの実行 */
+    act = bpf_prog_run_xdp(prog, &xdp);
+
+    /* 戻り値に応じた処理分岐 */
+    switch (act) {
+    case XDP_PASS:
+        *rx_headroom = xdp.data - xdp.data_hard_start;
+        *len = xdp.data_end - xdp.data;
+        return MLX5E_XDP_PASS;
+    case XDP_TX:
+        err = mlx5e_xdp_xmit(rq->netdev, 1, &xdp, 0);
+        if (unlikely(err))
+            goto xdp_abort;
+        __set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags);
+        return err ? MLX5E_XDP_CONSUMED : MLX5E_XDP_TX;
+    case XDP_REDIRECT:
+        /* リダイレクト処理 */
+        err = xdp_do_redirect(rq->netdev, &xdp, prog);
+        if (unlikely(err))
+            goto xdp_abort;
+        __set_bit(MLX5E_RQ_FLAG_XDP_REDIRECT, rq->flags);
+        return MLX5E_XDP_REDIRECT;
+    default:
+        bpf_warn_invalid_xdp_action(act);
+        fallthrough;
+    case XDP_ABORTED:
+xdp_abort:
+        trace_xdp_exception(rq->netdev, prog, act);
+        fallthrough;
+    case XDP_DROP:
+        return MLX5E_XDP_CONSUMED;
+    }
+}
+```
+
+**解析ポイント:**
+1. **プログラム取得**: `rcu_dereference()` でRCU保護されたプログラムポインターを取得
+2. **バッファ設定**: `xdp_buff` 構造体でパケットメタデータを準備
+3. **プログラム実行**: `bpf_prog_run_xdp()` でXDPプログラムを実行
+4. **結果処理**: XDP アクションに応じた分岐処理
+5. **統計更新**: `trace_xdp_exception()` で例外ケースをトレーシング
+
+#### eBPF Map の実装解析
+
+eBPF Map は eBPF プログラムとユーザー空間の間でデータを共有する仕組み：
+
+```c
+// include/linux/bpf.h
+struct bpf_map {
+    /* Hot fields */
+    const struct bpf_map_ops *ops ____cacheline_aligned;
+    struct bpf_map *inner_map_meta;
+    void *security;
+    enum bpf_map_type map_type;
+    u32 key_size;
+    u32 value_size;
+    u32 max_entries;
+    u32 map_flags;
+    int spin_lock_off; /* >=0 valid offset, <0 error */
+    u32 id;
+    int numa_node;
+    u32 btf_key_type_id;
+    u32 btf_value_type_id;
+    struct btf *btf;
+    struct mem_cgroup *memcg;
+    char name[BPF_OBJ_NAME_LEN];
+    u32 btf_vmlinux_value_type_id;
+    bool bypass_spec_v1;
+    bool frozen; /* write-once; write-protected by freeze_mutex */
+    /* 22 bytes hole */
+
+    /* The 3rd and 4th cacheline with misc members to avoid false sharing
+     * particularly with refcounting.
+     */
+    atomic64_t refcnt ____cacheline_aligned;
+    atomic64_t usercnt;
+    struct work_struct work;
+    struct mutex freeze_mutex;
+    u64 writecnt; /* writable mmap cnt; protected by freeze_mutex */
+};
+```
+
+**Map 操作の実装例（ハッシュマップ）:**
+
+```c
+// kernel/bpf/hashtab.c
+static void *htab_map_lookup_elem(struct bpf_map *map, void *key)
+{
+    struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+    struct hlist_nulls_head *head;
+    struct htab_elem *l;
+    u32 hash, key_size;
+
+    WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
+
+    key_size = map->key_size;
+
+    /* ハッシュ値の計算 */
+    hash = htab_map_hash(key, key_size, htab->hashrnd);
+
+    /* バケット選択 */
+    head = select_bucket(htab, hash);
+
+    /* RCU保護下での線形探索 */
+    l = lookup_nulls_elem_raw(head, hash, key, key_size, htab->n_buckets);
+
+    return l ? l->key + round_up(key_size, 8) : NULL;
+}
+
+static int htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+                               u64 map_flags)
+{
+    struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+    struct htab_elem *l_new = NULL, *l_old;
+    struct hlist_nulls_head *head;
+    unsigned long flags;
+    struct bucket *b;
+    u32 key_size, hash;
+    int ret;
+
+    if (unlikely((map_flags & ~BPF_F_LOCK) > BPF_EXIST))
+        return -EINVAL;
+
+    WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
+
+    key_size = map->key_size;
+
+    if (unlikely(map_flags & BPF_F_LOCK)) {
+        if (unlikely(!map_value_has_spin_lock(map)))
+            return -EINVAL;
+        if (unlikely(map_flags & BPF_NOEXIST))
+            return -EINVAL;
+    }
+
+    hash = htab_map_hash(key, key_size, htab->hashrnd);
+
+    b = __select_bucket(htab, hash);
+    head = &b->head;
+
+    /* 既存エントリの検索 */
+    if (map_flags & BPF_F_LOCK) {
+        l_old = lookup_elem_raw(head, hash, key, key_size);
+        if (!l_old)
+            return -ENOENT;
+        if (map_flags & BPF_F_LOCK)
+            copy_map_value_locked(map, l_old->key + round_up(key_size, 8),
+                                 value, false);
+        else
+            copy_map_value(map, l_old->key + round_up(key_size, 8), value);
+        return 0;
+    }
+
+    /* 新しいエントリの割り当て */
+    l_new = alloc_htab_elem(htab, key, value, key_size, hash, false, false,
+                           l_old);
+    if (IS_ERR(l_new))
+        return PTR_ERR(l_new);
+
+    /* スピンロック取得 */
+    ret = htab_lock_bucket(htab, b, hash, &flags);
+    if (ret)
+        goto err;
+
+    l_old = lookup_elem_raw(head, hash, key, key_size);
+
+    ret = check_flags(htab, l_old, map_flags);
+    if (ret)
+        goto err;
+
+    /* 既存エントリの置き換えまたは新規追加 */
+    if (l_old) {
+        /* 既存エントリを置き換え */
+        hlist_nulls_replace_rcu(&l_old->hash_node, &l_new->hash_node);
+    } else {
+        /* 新規エントリを追加 */
+        hlist_nulls_add_head_rcu(&l_new->hash_node, head);
+        if (htab_is_lru(htab))
+            bpf_lru_add(&htab->lru, &l_new->lru_node);
+        else
+            htab_inc_elem_count(htab);
+    }
+
+    htab_unlock_bucket(htab, b, hash, flags);
+
+    /* 古いエントリをRCU後に削除 */
+    if (l_old) {
+        if (htab_is_lru(htab))
+            bpf_lru_del(&htab->lru, &l_old->lru_node);
+        else
+            htab_dec_elem_count(htab);
+        call_rcu(&l_old->rcu, htab_elem_free_rcu);
+    }
+    return 0;
+
+err:
+    if (l_new)
+        bpf_mem_cache_free(&htab->ma, l_new);
+    htab_unlock_bucket(htab, b, hash, flags);
+    return ret;
+}
+```
+
+**解析ポイント:**
+1. **ハッシュ計算**: `htab_map_hash()` でキーから高速ハッシュを計算
+2. **RCU同期**: `rcu_read_lock()` で読み込み時のメモリ安全性を保証
+3. **バケット処理**: `select_bucket()` でハッシュテーブルのバケットを選択
+4. **スピンロック**: `htab_lock_bucket()` で書き込み時の排他制御
+5. **メモリ管理**: `bpf_mem_cache_free()` で効率的なメモリ割り当て/解放
+6. **LRU管理**: `bpf_lru_add()` で使用頻度に基づく自動削除
 
 ### Socket Filter による詳細パケット解析
 
