@@ -4,6 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## プロジェクト概要
 
+このプロジェクトは、Linux カーネル 6.16.2 のソースコードをリーディングを行い、その内容を整理してドキュメント化するプロジェクトです。
+
+ドキュメントは @docs/ ディレクトリにドキュメントを作成していきます。@docs/notes/ ディレクトリには、コードリーディングで得た知識や、Linux カーネルを理解するために必要な一般的な知識をまとめたドキュメントを格納されています。
+
+## コードリーディングの対象
+
 これは Linux カーネル 6.16.2 のソースコードです。Linux は、POSIX と Single UNIX Specification 準拠を目指す Unix クローンのオペレーティングシステムです。
 
 ## カーネルの機能
